@@ -48,18 +48,6 @@ REFRESH_OPTIONS: dict[str, int | None] = {
     "60 sec": 60,
 }
 
-# Tags from IB's account summary we care about for a balance view.
-BALANCE_TAGS = [
-    "NetLiquidation",
-    "TotalCashValue",
-    "AvailableFunds",
-    "BuyingPower",
-    "GrossPositionValue",
-    "UnrealizedPnL",
-    "RealizedPnL",
-]
-
-
 class IBClient:
     """Thread-backed wrapper around ib_async."""
 
@@ -91,9 +79,16 @@ class IBClient:
 
         return self._submit(_disc())
 
-    def account_summary(self) -> Future:
-        """Return a Future resolving to the list of AccountValue rows."""
-        return self._submit(self._ib.accountSummaryAsync())
+    def snapshot(self) -> Future:
+        """Resolve to (net_liquidation: float | None, portfolio_items)."""
+        return self._submit(self._snapshot())
+
+    async def _snapshot(self):
+        summary = await self._ib.accountSummaryAsync()
+        net_liq = next(
+            (float(v.value) for v in summary if v.tag == "NetLiquidation"), None
+        )
+        return net_liq, self._ib.portfolio()
 
     def on_disconnect(self, callback: Callable[[], None]) -> None:
         self._ib.disconnectedEvent += lambda *_: callback()
@@ -103,7 +98,7 @@ class TradingApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("IB Trading Dashboard")
-        self.geometry("560x460")
+        self.geometry("720x500")
 
         self.client = IBClient()
         self.client.on_disconnect(lambda: self._events.put(("disconnected", None)))
@@ -144,16 +139,30 @@ class TradingApp(tk.Tk):
         self.status_label = tk.Label(status, textvariable=self.status_var, fg="red")
         self.status_label.pack(side="left")
 
-        bal = ttk.LabelFrame(self, text="Account Balance")
-        bal.pack(fill="both", expand=True, padx=10, pady=10)
+        bal = ttk.LabelFrame(self, text="Net Liquidation")
+        bal.pack(fill="x", padx=10, pady=(0, 10))
+        self.netliq_var = tk.StringVar(value="—")
+        tk.Label(bal, textvariable=self.netliq_var, font=("Helvetica", 22, "bold")).pack(
+            anchor="w", padx=10, pady=8
+        )
 
-        self.tree = ttk.Treeview(bal, columns=("value", "currency"), show="tree headings", height=10)
-        self.tree.heading("#0", text="Metric")
+        pos = ttk.LabelFrame(self, text="Positions")
+        pos.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        cols = ("amount", "avgcost", "price", "value", "pnl")
+        self.tree = ttk.Treeview(pos, columns=cols, show="tree headings", height=10)
+        self.tree.heading("#0", text="Instrument")
+        self.tree.heading("amount", text="Amount")
+        self.tree.heading("avgcost", text="Avg Cost")
+        self.tree.heading("price", text="Latest Price")
         self.tree.heading("value", text="Value")
-        self.tree.heading("currency", text="Currency")
-        self.tree.column("#0", width=200)
-        self.tree.column("value", width=160, anchor="e")
-        self.tree.column("currency", width=90, anchor="center")
+        self.tree.heading("pnl", text="Unrealized P/L")
+        self.tree.column("#0", width=110)
+        self.tree.column("amount", width=80, anchor="e")
+        self.tree.column("avgcost", width=110, anchor="e")
+        self.tree.column("price", width=110, anchor="e")
+        self.tree.column("value", width=120, anchor="e")
+        self.tree.column("pnl", width=120, anchor="e")
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
 
         footer = ttk.Frame(self)
@@ -193,9 +202,9 @@ class TradingApp(tk.Tk):
         future.add_done_callback(lambda f: self._events.put(("connect_done", f)))
 
     def _refresh(self) -> None:
-        self._set_status("Fetching balance...", "orange")
-        future = self.client.account_summary()
-        future.add_done_callback(lambda f: self._events.put(("summary", f)))
+        self._set_status("Fetching...", "orange")
+        future = self.client.snapshot()
+        future.add_done_callback(lambda f: self._events.put(("snapshot", f)))
 
     def _reschedule_auto_refresh(self) -> None:
         """(Re)arm the auto-refresh timer based on the combobox selection."""
@@ -235,12 +244,13 @@ class TradingApp(tk.Tk):
             self.refresh_btn.config(state="normal")
             self._refresh()
             self._reschedule_auto_refresh()
-        elif kind == "summary":
+        elif kind == "snapshot":
             exc = payload.exception()
             if exc is not None:
-                self._set_status(f"Failed to fetch balance: {exc}", "red")
+                self._set_status(f"Failed to fetch: {exc}", "red")
                 return
-            self._populate_balance(payload.result())
+            net_liq, portfolio = payload.result()
+            self._populate(net_liq, portfolio)
             self._set_status("Connected", "green")
         elif kind == "disconnected":
             self._set_status("Disconnected", "red")
@@ -248,22 +258,29 @@ class TradingApp(tk.Tk):
             self.target_box.config(state="readonly")
             self.refresh_btn.config(state="disabled")
             self._reschedule_auto_refresh()
+            self.netliq_var.set("—")
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
-    def _populate_balance(self, rows: list) -> None:
-        by_tag = {row.tag: row for row in rows}
+    def _populate(self, net_liq, portfolio) -> None:
+        self.netliq_var.set(f"{net_liq:,.2f}" if net_liq is not None else "—")
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for tag in BALANCE_TAGS:
-            row = by_tag.get(tag)
-            if row is None:
-                continue
-            try:
-                value = f"{float(row.value):,.2f}"
-            except ValueError:
-                value = row.value
-            self.tree.insert("", "end", text=tag, values=(value, row.currency))
+        for it in portfolio:
+            symbol = it.contract.symbol
+            ccy = it.contract.currency
+            self.tree.insert(
+                "",
+                "end",
+                text=symbol,
+                values=(
+                    f"{it.position:,g}",
+                    f"{it.averageCost:,.2f} {ccy}",
+                    f"{it.marketPrice:,.2f} {ccy}",
+                    f"{it.marketValue:,.2f} {ccy}",
+                    f"{it.unrealizedPNL:,.2f} {ccy}",
+                ),
+            )
 
     def _on_close(self) -> None:
         if self.client.connected:
