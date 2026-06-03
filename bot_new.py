@@ -18,14 +18,16 @@ Tk loop never blocks.
 from __future__ import annotations
 
 import asyncio
+import math
 import queue
 import threading
 import tkinter as tk
 from concurrent.futures import Future
+from datetime import datetime
 from tkinter import ttk
 from typing import Callable
 
-from ib_async import IB
+from ib_async import IB, Stock
 
 # Selectable connection targets. Host and client id are handled internally;
 # the user only picks which TWS/Gateway endpoint to talk to.
@@ -47,6 +49,21 @@ REFRESH_OPTIONS: dict[str, int | None] = {
     "30 sec": 30,
     "60 sec": 60,
 }
+
+# NASDAQ-100 constituents (US tech-heavy index). May drift over time as the
+# index is reconstituted, but good enough for a price watchlist.
+NASDAQ100 = [
+    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
+    "AMZN", "ANSS", "APP", "ARM", "ASML", "AVGO", "AZN", "BIIB", "BKNG", "BKR",
+    "CCEP", "CDNS", "CDW", "CEG", "CHTR", "CMCSA", "COST", "CPRT", "CRWD", "CSCO",
+    "CSGP", "CSX", "CTAS", "CTSH", "DASH", "DDOG", "DXCM", "EA", "EXC", "FANG",
+    "FAST", "FTNT", "GEHC", "GFS", "GILD", "GOOG", "GOOGL", "HON", "IDXX", "ILMN",
+    "INTC", "INTU", "ISRG", "KDP", "KHC", "KLAC", "LIN", "LRCX", "LULU", "MAR",
+    "MCHP", "MDLZ", "MELI", "META", "MNST", "MRVL", "MSFT", "MU", "NFLX", "NVDA",
+    "NXPI", "ODFL", "ON", "ORLY", "PANW", "PAYX", "PCAR", "PDD", "PEP", "PLTR",
+    "PYPL", "QCOM", "REGN", "ROP", "ROST", "SBUX", "SNPS", "TEAM", "TMUS", "TSLA",
+    "TTD", "TTWO", "TXN", "VRSK", "VRTX", "WBD", "WDAY", "XEL", "ZS",
+]
 
 class IBClient:
     """Thread-backed wrapper around ib_async."""
@@ -89,6 +106,23 @@ class IBClient:
             (float(v.value) for v in summary if v.tag == "NetLiquidation"), None
         )
         return net_liq, self._ib.portfolio()
+
+    def instrument_prices(self, symbols: list[str]) -> Future:
+        """Resolve to {symbol: price}; price is NaN when no data is available."""
+        return self._submit(self._instrument_prices(symbols))
+
+    async def _instrument_prices(self, symbols: list[str]) -> dict[str, float]:
+        # Delayed data (type 3) needs no live market-data subscription.
+        self._ib.reqMarketDataType(3)
+        prices: dict[str, float] = {}
+        # Batch to stay under IB's simultaneous market-data line limit.
+        for i in range(0, len(symbols), 50):
+            batch = symbols[i : i + 50]
+            contracts = [Stock(s, "SMART", "USD") for s in batch]
+            tickers = await self._ib.reqTickersAsync(*contracts)
+            for t in tickers:
+                prices[t.contract.symbol] = t.marketPrice()
+        return prices
 
     def on_disconnect(self, callback: Callable[[], None]) -> None:
         self._ib.disconnectedEvent += lambda *_: callback()
@@ -139,15 +173,42 @@ class TradingApp(tk.Tk):
         self.status_label = tk.Label(status, textvariable=self.status_var, fg="red")
         self.status_label.pack(side="left")
 
-        bal = ttk.LabelFrame(self, text="Net Liquidation")
-        bal.pack(fill="x", padx=10, pady=(0, 10))
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        self._build_balance_tab(self.notebook)
+        self._build_instruments_tab(self.notebook)
+
+        footer = ttk.Frame(self)
+        footer.pack(pady=(0, 10))
+
+        self.refresh_btn = ttk.Button(footer, text="Refresh", command=self._refresh, state="disabled")
+        self.refresh_btn.pack(side="left", padx=6)
+
+        ttk.Label(footer, text="Auto-refresh").pack(side="left", padx=(12, 4))
+        self.freq_var = tk.StringVar(value="Manual")
+        self.freq_box = ttk.Combobox(
+            footer,
+            textvariable=self.freq_var,
+            values=list(REFRESH_OPTIONS),
+            state="readonly",
+            width=8,
+        )
+        self.freq_box.pack(side="left")
+        self.freq_box.bind("<<ComboboxSelected>>", lambda _e: self._reschedule_auto_refresh())
+
+    def _build_balance_tab(self, notebook: ttk.Notebook) -> None:
+        tab = ttk.Frame(notebook)
+        notebook.add(tab, text="Balance")
+
+        bal = ttk.LabelFrame(tab, text="Net Liquidation")
+        bal.pack(fill="x", padx=6, pady=6)
         self.netliq_var = tk.StringVar(value="—")
         tk.Label(bal, textvariable=self.netliq_var, font=("Helvetica", 22, "bold")).pack(
             anchor="w", padx=10, pady=8
         )
 
-        pos = ttk.LabelFrame(self, text="Positions")
-        pos.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        pos = ttk.LabelFrame(tab, text="Positions")
+        pos.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         cols = ("amount", "avgcost", "price", "value", "pnl")
         self.tree = ttk.Treeview(pos, columns=cols, show="tree headings", height=10)
@@ -165,23 +226,40 @@ class TradingApp(tk.Tk):
         self.tree.column("pnl", width=120, anchor="e")
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
 
-        footer = ttk.Frame(self)
-        footer.pack(pady=(0, 10))
-
-        self.refresh_btn = ttk.Button(footer, text="Refresh Balance", command=self._refresh, state="disabled")
-        self.refresh_btn.pack(side="left", padx=6)
-
-        ttk.Label(footer, text="Auto-refresh").pack(side="left", padx=(12, 4))
-        self.freq_var = tk.StringVar(value="Manual")
-        self.freq_box = ttk.Combobox(
-            footer,
-            textvariable=self.freq_var,
-            values=list(REFRESH_OPTIONS),
-            state="readonly",
-            width=8,
+        self.balance_time_var = tk.StringVar(value="Last refreshed: —")
+        ttk.Label(tab, textvariable=self.balance_time_var, foreground="#888").pack(
+            anchor="e", padx=8, pady=(0, 4)
         )
-        self.freq_box.pack(side="left")
-        self.freq_box.bind("<<ComboboxSelected>>", lambda _e: self._reschedule_auto_refresh())
+
+    def _build_instruments_tab(self, notebook: ttk.Notebook) -> None:
+        tab = ttk.Frame(notebook)
+        self.inst_tab = tab
+        notebook.add(tab, text="Instruments")
+
+        ttk.Label(tab, text="NASDAQ-100", font=("Helvetica", 12, "bold")).pack(
+            anchor="w", padx=8, pady=(6, 2)
+        )
+
+        wrap = ttk.Frame(tab)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.inst_tree = ttk.Treeview(wrap, columns=("price",), show="tree headings", height=12)
+        self.inst_tree.heading("#0", text="Instrument")
+        self.inst_tree.heading("price", text="Latest Price")
+        self.inst_tree.column("#0", width=160)
+        self.inst_tree.column("price", width=160, anchor="e")
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.inst_tree.yview)
+        self.inst_tree.configure(yscrollcommand=scroll.set)
+        self.inst_tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", padx=8, pady=(0, 4))
+        self.inst_btn = ttk.Button(
+            bar, text="Refresh Prices", command=self._refresh_instruments, state="disabled"
+        )
+        self.inst_btn.pack(side="left")
+        self.instruments_time_var = tk.StringVar(value="Last refreshed: —")
+        ttk.Label(bar, textvariable=self.instruments_time_var, foreground="#888").pack(side="right")
 
     # --- actions ---------------------------------------------------------
     def _set_status(self, text: str, color: str) -> None:
@@ -206,6 +284,12 @@ class TradingApp(tk.Tk):
         future = self.client.snapshot()
         future.add_done_callback(lambda f: self._events.put(("snapshot", f)))
 
+    def _refresh_instruments(self) -> None:
+        self.inst_btn.config(state="disabled")
+        self.instruments_time_var.set("Fetching prices...")
+        future = self.client.instrument_prices(NASDAQ100)
+        future.add_done_callback(lambda f: self._events.put(("instruments", f)))
+
     def _reschedule_auto_refresh(self) -> None:
         """(Re)arm the auto-refresh timer based on the combobox selection."""
         if self._refresh_after_id is not None:
@@ -219,6 +303,9 @@ class TradingApp(tk.Tk):
         self._refresh_after_id = None
         if self.client.connected:
             self._refresh()
+            # Only refresh the (heavier) instrument prices when that tab is visible.
+            if self.notebook.select() == str(self.inst_tab):
+                self._refresh_instruments()
         self._reschedule_auto_refresh()
 
     # --- event pump ------------------------------------------------------
@@ -242,7 +329,9 @@ class TradingApp(tk.Tk):
             self._set_status("Connected", "green")
             self.connect_btn.config(state="normal", text="Disconnect")
             self.refresh_btn.config(state="normal")
+            self.inst_btn.config(state="normal")
             self._refresh()
+            self._refresh_instruments()
             self._reschedule_auto_refresh()
         elif kind == "snapshot":
             exc = payload.exception()
@@ -251,16 +340,30 @@ class TradingApp(tk.Tk):
                 return
             net_liq, portfolio = payload.result()
             self._populate(net_liq, portfolio)
+            self.balance_time_var.set(f"Last refreshed: {datetime.now():%H:%M:%S}")
             self._set_status("Connected", "green")
+        elif kind == "instruments":
+            self.inst_btn.config(state="normal" if self.client.connected else "disabled")
+            exc = payload.exception()
+            if exc is not None:
+                self.instruments_time_var.set(f"Failed: {exc}")
+                return
+            self._populate_instruments(payload.result())
+            self.instruments_time_var.set(f"Last refreshed: {datetime.now():%H:%M:%S}")
         elif kind == "disconnected":
             self._set_status("Disconnected", "red")
             self.connect_btn.config(state="normal", text="Connect")
             self.target_box.config(state="readonly")
             self.refresh_btn.config(state="disabled")
+            self.inst_btn.config(state="disabled")
             self._reschedule_auto_refresh()
             self.netliq_var.set("—")
+            self.balance_time_var.set("Last refreshed: —")
+            self.instruments_time_var.set("Last refreshed: —")
             for item in self.tree.get_children():
                 self.tree.delete(item)
+            for item in self.inst_tree.get_children():
+                self.inst_tree.delete(item)
 
     def _populate(self, net_liq, portfolio) -> None:
         self.netliq_var.set(f"{net_liq:,.2f}" if net_liq is not None else "—")
@@ -281,6 +384,14 @@ class TradingApp(tk.Tk):
                     f"{it.unrealizedPNL:,.2f} {ccy}",
                 ),
             )
+
+    def _populate_instruments(self, prices: dict[str, float]) -> None:
+        for item in self.inst_tree.get_children():
+            self.inst_tree.delete(item)
+        for sym in NASDAQ100:
+            price = prices.get(sym)
+            text = "—" if price is None or math.isnan(price) else f"{price:,.2f}"
+            self.inst_tree.insert("", "end", text=sym, values=(text,))
 
     def _on_close(self) -> None:
         if self.client.connected:
