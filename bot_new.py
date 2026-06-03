@@ -119,7 +119,9 @@ class IBClient:
         for i in range(0, len(symbols), 50):
             batch = symbols[i : i + 50]
             contracts = [Stock(s, "SMART", "USD") for s in batch]
-            tickers = await self._ib.reqTickersAsync(*contracts)
+            # reqTickers requires qualified contracts (with a conId).
+            qualified = await self._ib.qualifyContractsAsync(*contracts)
+            tickers = await self._ib.reqTickersAsync(*qualified)
             for t in tickers:
                 prices[t.contract.symbol] = t.marketPrice()
         return prices
