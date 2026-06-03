@@ -115,13 +115,15 @@ class IBClient:
         # Delayed data (type 3) needs no live market-data subscription.
         self._ib.reqMarketDataType(3)
         prices: dict[str, float] = {}
+        # primaryExchange disambiguates SMART lookups (NASDAQ-100 is NASDAQ-listed).
+        contracts = [Stock(s, "SMART", "USD", primaryExchange="NASDAQ") for s in symbols]
+        # reqTickers requires qualified contracts (with a conId); qualifyContracts
+        # returns None for any symbol it can't resolve, so drop those.
+        qualified = await self._ib.qualifyContractsAsync(*contracts)
+        valid = [c for c in qualified if c is not None and c.conId]
         # Batch to stay under IB's simultaneous market-data line limit.
-        for i in range(0, len(symbols), 50):
-            batch = symbols[i : i + 50]
-            contracts = [Stock(s, "SMART", "USD") for s in batch]
-            # reqTickers requires qualified contracts (with a conId).
-            qualified = await self._ib.qualifyContractsAsync(*contracts)
-            tickers = await self._ib.reqTickersAsync(*qualified)
+        for i in range(0, len(valid), 50):
+            tickers = await self._ib.reqTickersAsync(*valid[i : i + 50])
             for t in tickers:
                 prices[t.contract.symbol] = t.marketPrice()
         return prices
